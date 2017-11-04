@@ -23,6 +23,8 @@ from onnx_caffe2.workspace import Workspace
 from onnx_caffe2.backend_rep import Caffe2Rep
 from onnx_caffe2.helper import dummy_name
 
+import warnings
+
 
 def get_device_option(device):
     m = {DeviceType.CPU: caffe2_pb2.CPU,
@@ -95,6 +97,22 @@ class OnnxNode(object):
 
 class Caffe2Backend(Backend):
 
+    # The greatest version of the ONNX operator set which we are aware of.
+    # Models whose version is larger than this will cause us to emit a warning
+    # that we are attempting to translate on a "best effort" basis.
+    #
+    # If you increase this, make SURE you cross-reference all BC-breaking
+    # changes from one version to the next, and any that you did not
+    # implement, mark as broken in _broken_operators
+    _known_opset_version = 1
+
+    # This dictionary will record operators which are KNOWN to be
+    # broken, so we give a good error message rather than do something
+    # bogus and then fail.
+    _broken_operators = {
+        # 'BrokenOp': version_it_was_broken_in
+    }
+
     # Operators that are different between Caffe2 and
     # ONNX but only in their name.
     # In most cases, this should be empty - as the effort of ONNX is
@@ -134,8 +152,11 @@ class Caffe2Backend(Backend):
         'Slice': '_create_slice',
     }
 
+    # NB: By default, you will use the LATEST definition of the operator,
+    # so this interface MAY make BC-breaking changes.  Specify an
+    # opset_version if you don't want this to version.
     @classmethod
-    def run_node(cls, node, inputs, device='CPU'):
+    def run_node(cls, node, inputs, device='CPU', opset_version=None):
         super(Caffe2Backend, cls).run_node(node, inputs, device)
 
         device_option = get_device_option(Device(device))
@@ -149,7 +170,7 @@ class Caffe2Backend(Backend):
                     workspace.FeedBlob(key, value)
 
             cls._inplace_rewrite([node])
-            ops = cls._onnx_node_to_caffe2_op(node)
+            ops = cls._onnx_node_to_caffe2_op(node, opset_version or cls._known_opset_version)
             for op in ops:
                 workspace.RunOperatorOnce(op)
             output_values = [workspace.FetchBlob(name) for name in node.output]
@@ -209,12 +230,12 @@ class Caffe2Backend(Backend):
         return c2_op
 
     @classmethod
-    def _create_constant(cls, n):
+    def _create_constant(cls, n, opset_version):
         assert len(n.outputs) == 1
         return cls._create_tensor_filling_op(n.attrs["value"], n.outputs[0])
 
     @classmethod
-    def _create_gemm(cls, n):
+    def _create_gemm(cls, n, opset_version):
         (A, B, C) = n.inputs
         (Y,) = n.outputs
         alpha = n.attrs.get('alpha', 1.)
@@ -252,7 +273,7 @@ class Caffe2Backend(Backend):
         return ops
 
     @classmethod
-    def _create_pad(cls, n):
+    def _create_pad(cls, n, opset_version):
         paddings = n.attrs['paddings']
         if not (len(paddings) == 8 and
                 # first two dim is for batch and channel
@@ -261,20 +282,20 @@ class Caffe2Backend(Backend):
         t, l, b, r = paddings[4:]
         paddings[:] = [t, b, l, r]
 
-        return cls._common_onnx_node_to_caffe2_op(n)
+        return cls._common_onnx_node_to_caffe2_op(n, opset_version)
 
     @classmethod
-    def _create_concat(cls, n):
+    def _create_concat(cls, n, opset_version):
         # TODO: Caffe2 Concat has an extra output. It should be only
         # used when doing training, so we should change Caffe2 to allow
         # 1 output.
-        op = cls._common_onnx_node_to_caffe2_op(n)
+        op = cls._common_onnx_node_to_caffe2_op(n, opset_version)
         assert len(op.output) == 1
         op.output.append(dummy_name())
         return op
 
     @classmethod
-    def _create_optimized_rnn(cls, n):
+    def _create_optimized_rnn(cls, n, opset_version):
         # TODO: we cheat and rely on the fact that ONNX weight layout matches
         # CuDNN's. Properly we should extract the weight tensor and invoke
         # RecurrentParamSet exposed by C2
@@ -298,8 +319,8 @@ class Caffe2Backend(Backend):
         return op
 
     @classmethod
-    def _create_slice(cls, n):
-        op = cls._common_onnx_node_to_caffe2_op(n)
+    def _create_slice(cls, n, opset_version):
+        op = cls._common_onnx_node_to_caffe2_op(n, opset_version)
         args = {arg.name: arg for arg in op.arg}
         starts_vals = np.array(
             args.pop('starts').ints, dtype=np.int64).tolist()
@@ -437,7 +458,7 @@ class Caffe2Backend(Backend):
     # differently.
 
     @classmethod
-    def _create_conv_pool_op_base(cls, n):
+    def _create_conv_pool_op_base(cls, n, opset_version):
         if n.op_type.startswith('Global'):
             n.attrs['global_pooling'] = 1
 
@@ -451,11 +472,11 @@ class Caffe2Backend(Backend):
                 # Caffe2 requires pads to be twice the size of kernels.
                 n.attrs['pads'] = pads * 2
 
-        return cls._common_onnx_node_to_caffe2_op(n)
+        return cls._common_onnx_node_to_caffe2_op(n, opset_version)
 
     @classmethod
-    def _create_reshape(cls, n):
-        c2_op = cls._common_onnx_node_to_caffe2_op(n)
+    def _create_reshape(cls, n, opset_version):
+        c2_op = cls._common_onnx_node_to_caffe2_op(n, opset_version)
         # Caffe2 has an extra output
         c2_op.output.append(dummy_name())
         return c2_op
@@ -471,7 +492,21 @@ class Caffe2Backend(Backend):
         '''
         super(Caffe2Backend, cls).prepare(model, device, **kwargs)
 
-        init_net, predict_net = cls.onnx_graph_to_caffe2_net(model.graph)
+        if model.ir_version >= 0x00000003:
+            opset_version = None
+            for imp in model.opset_import:
+                if not imp.HasField("domain") or imp.domain == "":
+                    opset_version = imp.version
+                    if imp.version > cls._known_opset_version:
+                        warnings.warn("This version of onnx-caffe2 targets ONNX operator set version {}, but the model we are trying to import uses version {}.  We will try to import it anyway, but if the model uses operators which had BC-breaking changes in the intervening versions, import will fail.".format(cls._known_opset_version, imp.version))
+                else:
+                    warnings.warn("Unrecognized operator set {}".format(imp.domain))
+            if opset_version is None:
+                raise RuntimeError("Model did not specify ONNX operator set version (onnx-caffe2 requires it)")
+        else:
+            opset_version = 1
+
+        init_net, predict_net = cls.onnx_graph_to_caffe2_net(model.graph, opset_version)
         predict_net.device_option.CopyFrom(get_device_option(Device(device)))
 
         initialized = {init.name for init in model.graph.initializer}
@@ -486,18 +521,18 @@ class Caffe2Backend(Backend):
 
     @classmethod
     # TODO: This method needs a refactor for clarity
-    def _onnx_node_to_caffe2_op(cls, node_def):
+    def _onnx_node_to_caffe2_op(cls, node_def, opset_version):
         if node_def.op_type in cls._special_operators:
             translator = getattr(cls, cls._special_operators[node_def.op_type])
         else:
             translator = cls._common_onnx_node_to_caffe2_op
-        ops = translator(OnnxNode(node_def))
+        ops = translator(OnnxNode(node_def), opset_version)
         if not isinstance(ops, collections.Iterable):
             ops = [ops]
         return ops
 
     @classmethod
-    def _common_onnx_node_to_caffe2_op(cls, onnx_node):
+    def _common_onnx_node_to_caffe2_op(cls, onnx_node, opset_version):
         """
         This translator performs the basic translation of ONNX nodes into
         Caffe2 operators.  Besides doing a straightforward marshalling from
@@ -517,6 +552,10 @@ class Caffe2Backend(Backend):
         c2_op.name = onnx_node.name
 
         onnx_op_type = onnx_node.op_type
+        broken_version = cls._broken_operators.get(onnx_op_type, float('Inf'))
+        if broken_version <= opset_version:
+            raise ValueError(
+                "Don't know how to translate op {} in ONNX operator set v{} (I only support prior to v{})".format(onnx_op_type, opset_version, broken_version))
         c2_op.type = cls._renamed_operators.get(onnx_op_type, onnx_op_type)
         if not core.IsOperator(c2_op.type):
             raise ValueError(
@@ -589,7 +628,7 @@ class Caffe2Backend(Backend):
         return names
 
     @classmethod
-    def onnx_graph_to_caffe2_net(cls, graph_def):
+    def onnx_graph_to_caffe2_net(cls, graph_def, opset_version):
         cls._inplace_rewrite(graph_def)
         if graph_def.initializer:
             init_net = cls.onnx_initializer_to_caffe2_init_net(
@@ -604,7 +643,7 @@ class Caffe2Backend(Backend):
         predict_net = caffe2_pb2.NetDef()
         predict_net.name = graph_def.name
         for node in graph_def.node:
-            predict_net.op.extend(cls._onnx_node_to_caffe2_op(node))
+            predict_net.op.extend(cls._onnx_node_to_caffe2_op(node, opset_version))
 
         predict_net.external_input.extend(
             value_info.name for value_info in graph_def.input)
@@ -620,7 +659,10 @@ class Caffe2Backend(Backend):
             op_def.output.extend([value_info.name])
             op_def.type = 'GivenTensorFill'
 
-            shape = list(d.dim_value for d in value_info.type.tensor_type.shape.dim)
+            # However, DON'T actually put in the real shapes, because if you
+            # do we're going to spend a veeery long time running GivenTensorFill
+            # (but honestly, why do we need to do this anyway...)
+            shape = (1,)
 
             shape_arg = op_def.arg.add()
             shape_arg.name = 'shape'
